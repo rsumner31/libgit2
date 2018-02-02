@@ -15,12 +15,14 @@
 #include "smart.h"
 #include "cred.h"
 #include "socket_stream.h"
+#include "ssh.h"
 
 #ifdef GIT_SSH
 
 #define OWNING_SUBTRANSPORT(s) ((ssh_subtransport *)(s)->parent.subtransport)
 
-static const char prefix_ssh[] = "ssh://";
+static const char *ssh_prefixes[] = { "ssh://", "ssh+git://", "git+ssh://" };
+
 static const char cmd_uploadpack[] = "git-upload-pack";
 static const char cmd_receivepack[] = "git-receive-pack";
 
@@ -53,6 +55,33 @@ static void ssh_error(LIBSSH2_SESSION *session, const char *errmsg)
 	giterr_set(GITERR_SSH, "%s: %s", errmsg, ssherr);
 }
 
+/* 
+ * Locate where in scp_url the path starts taking both port number and regular :
+ * usage for scp into account.
+ *
+ * ':' is both used to delimit hostname:port and to indicate that remainder
+ * of url relative path which makes it problmematic to both use relative paths and custom
+ * port number.
+ */
+static char* scp_path_start(char const* scp_url) {
+    char* colon = strchr(scp_url, ':');
+    if(!colon) return NULL;
+    
+    // step through url to check if there is "[0-9]:" which we then skip past
+    char* ptr = colon + 1;
+    while(1) {
+        char c = *ptr;
+        
+        // we found second colon without non-digits in-between
+        if(c == ':') return ptr + 1;
+        
+        if(c >= '0' && c <= '9') ++ptr;
+        else {
+            return colon + 1;
+        }
+    }
+}
+
 /*
  * Create a git protocol request.
  *
@@ -62,17 +91,23 @@ static int gen_proto(git_buf *request, const char *cmd, const char *url)
 {
 	char *repo;
 	int len;
+	size_t i;
 
-	if (!git__prefixcmp(url, prefix_ssh)) {
-		url = url + strlen(prefix_ssh);
-		repo = strchr(url, '/');
-		if (repo && repo[1] == '~')
-			++repo;
-	} else {
-		repo = strchr(url, ':');
-		if (repo) repo++;
+	for (i = 0; i < ARRAY_SIZE(ssh_prefixes); ++i) {
+		const char *p = ssh_prefixes[i];
+
+		if (!git__prefixcmp(url, p)) {
+			url = url + strlen(p);
+			repo = strchr(url, '/');
+			if (repo && repo[1] == '~')
+				++repo;
+
+			goto done;
+		}
 	}
+	repo = scp_path_start(url);
 
+done:
 	if (!repo) {
 		giterr_set(GITERR_NET, "Malformed git protocol URL");
 		return -1;
@@ -136,9 +171,14 @@ static int ssh_stream_read(
 	 * not-found error, so read from stderr and signal EOF on
 	 * stderr.
 	 */
-	if (rc == 0 && (rc = libssh2_channel_read_stderr(s->channel, buffer, buf_size)) > 0) {
-		giterr_set(GITERR_SSH, "%*s", rc, buffer);
-		return GIT_EEOF;
+	if (rc == 0) {
+		if ((rc = libssh2_channel_read_stderr(s->channel, buffer, buf_size)) > 0) {
+			giterr_set(GITERR_SSH, "%*s", rc, buffer);
+			return GIT_EEOF;
+		} else if (rc < LIBSSH2_ERROR_NONE) {
+			ssh_error(s->session, "SSH could not read stderr");
+			return -1;
+		}
 	}
 
 
@@ -240,14 +280,15 @@ static int ssh_stream_alloc(
 
 static int git_ssh_extract_url_parts(
 	char **host,
+	char **port,
 	char **username,
 	const char *url)
 {
-	char *colon, *at;
+	char *colon, *at, *path;
 	const char *start;
 
 	colon = strchr(url, ':');
-
+	path = scp_path_start(url);
 
 	at = strchr(url, '@');
 	if (at) {
@@ -263,6 +304,20 @@ static int git_ssh_extract_url_parts(
 		giterr_set(GITERR_NET, "Malformed URL");
 		return -1;
 	}
+	
+	// colon is both used to delimit hostname and port number and to indicate that remainder
+	// of url is relative path and we allow two colon when only digits are in-between to allow
+	// setting both non-standard port and relative path.
+	if(colon + 1 < path) {
+		// extract port number in sitation where
+		//       username@hostname:123456789:directory/subdir/repo.git
+		//                         ^         ^
+		//                     (colon+1)    path
+		*port = git__substrdup(colon + 1, (path - 1) - (colon + 1));
+		GITERR_CHECK_ALLOC(*port);
+	 } else {
+		*port = NULL;
+	 }
 
 	*host = git__substrdup(start, colon - start);
 	GITERR_CHECK_ALLOC(*host);
@@ -494,6 +549,7 @@ static int _git_ssh_setup_conn(
 	char *host=NULL, *port=NULL, *path=NULL, *user=NULL, *pass=NULL;
 	const char *default_port="22";
 	int auth_methods, error = 0;
+	size_t i;
 	ssh_stream *s;
 	git_cred *cred = NULL;
 	LIBSSH2_SESSION* session=NULL;
@@ -509,16 +565,25 @@ static int _git_ssh_setup_conn(
 	s->session = NULL;
 	s->channel = NULL;
 
-	if (!git__prefixcmp(url, prefix_ssh)) {
-		if ((error = gitno_extract_url_parts(&host, &port, &path, &user, &pass, url, default_port)) < 0)
-			goto done;
-	} else {
-		if ((error = git_ssh_extract_url_parts(&host, &user, url)) < 0)
-			goto done;
+	for (i = 0; i < ARRAY_SIZE(ssh_prefixes); ++i) {
+		const char *p = ssh_prefixes[i];
+
+		if (!git__prefixcmp(url, p)) {
+			if ((error = gitno_extract_url_parts(&host, &port, &path, &user, &pass, url, default_port)) < 0)
+				goto done;
+
+			goto post_extract;
+		}
+	}
+	if ((error = git_ssh_extract_url_parts(&host, &port, &user, url)) < 0)
+		goto done;
+		
+	if(!port) {
 		port = git__strdup(default_port);
 		GITERR_CHECK_ALLOC(port);
 	}
 
+post_extract:
 	if ((error = git_socket_stream_new(&s->io, host, port)) < 0 ||
 	    (error = git_stream_connect(s->io)) < 0)
 		goto done;
@@ -756,8 +821,10 @@ static int list_auth_methods(int *out, LIBSSH2_SESSION *session, const char *use
 	list = libssh2_userauth_list(session, username, strlen(username));
 
 	/* either error, or the remote accepts NONE auth, which is bizarre, let's punt */
-	if (list == NULL && !libssh2_userauth_authenticated(session))
+	if (list == NULL && !libssh2_userauth_authenticated(session)) {
+		ssh_error(session, "Failed to retrieve list of SSH authentication methods");
 		return -1;
+	}
 
 	ptr = list;
 	while (ptr) {
@@ -867,5 +934,20 @@ int git_transport_ssh_with_paths(git_transport **out, git_remote *owner, void *p
 
 	giterr_set(GITERR_INVALID, "Cannot create SSH transport. Library was built without SSH support");
 	return -1;
+#endif
+}
+
+int git_transport_ssh_global_init(void)
+{
+#ifdef GIT_SSH
+
+	libssh2_init(0);
+	return 0;
+
+#else
+
+	/* Nothing to initialize */
+	return 0;
+
 #endif
 }

@@ -53,8 +53,10 @@ int git_refspec__parse(git_refspec *refspec, const char *input, bool is_fetch)
 
 	if (rhs) {
 		size_t rlen = strlen(++rhs);
-		is_glob = (1 <= rlen && strchr(rhs, '*'));
-		refspec->dst = git__strndup(rhs, rlen);
+		if (rlen || !is_fetch) {
+			is_glob = (1 <= rlen && strchr(rhs, '*'));
+			refspec->dst = git__strndup(rhs, rlen);
+		}
 	}
 
 	llen = (rhs ? (size_t)(rhs - lhs - 1) : strlen(lhs));
@@ -323,8 +325,8 @@ int git_refspec__dwim_one(git_vector *out, git_refspec *spec, git_vector *refs)
 	if (git__prefixcmp(spec->src, GIT_REFS_DIR)) {
 		for (j = 0; formatters[j]; j++) {
 			git_buf_clear(&buf);
-			if (git_buf_printf(&buf, formatters[j], spec->src) < 0)
-				return -1;
+			git_buf_printf(&buf, formatters[j], spec->src);
+			GITERR_CHECK_ALLOC_BUF(&buf);
 
 			key.name = (char *) git_buf_cstr(&buf);
 			if (!git_vector_search(&pos, refs, &key)) {
@@ -348,8 +350,8 @@ int git_refspec__dwim_one(git_vector *out, git_refspec *spec, git_vector *refs)
 			git_buf_puts(&buf, GIT_REFS_HEADS_DIR);
 		}
 
-		if (git_buf_puts(&buf, spec->dst) < 0)
-			return -1;
+		git_buf_puts(&buf, spec->dst);
+		GITERR_CHECK_ALLOC_BUF(&buf);
 
 		cur->dst = git_buf_detach(&buf);
 	}

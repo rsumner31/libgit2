@@ -11,35 +11,64 @@
 #define GIT_IGNORE_DEFAULT_RULES ".\n..\n.git\n"
 
 /**
- * A negative ignore pattern can match a positive one without
- * wildcards if its pattern equals the tail of the positive
- * pattern. Thus
+ * A negative ignore pattern can negate a positive one without
+ * wildcards if it is a basename only and equals the basename of
+ * the positive pattern. Thus
  *
  * foo/bar
  * !bar
  *
- * would result in foo/bar being unignored again.
+ * would result in foo/bar being unignored again while
+ *
+ * moo/foo/bar
+ * !foo/bar
+ *
+ * would do nothing. The reverse also holds true: a positive
+ * basename pattern can be negated by unignoring the basename in
+ * subdirectories. Thus
+ *
+ * bar
+ * !foo/bar
+ *
+ * would result in foo/bar being unignored again. As with the
+ * first case,
+ *
+ * foo/bar
+ * !moo/foo/bar
+ *
+ * would do nothing, again.
  */
 static int does_negate_pattern(git_attr_fnmatch *rule, git_attr_fnmatch *neg)
 {
+	git_attr_fnmatch *longer, *shorter;
 	char *p;
 
 	if ((rule->flags & GIT_ATTR_FNMATCH_NEGATIVE) == 0
 		&& (neg->flags & GIT_ATTR_FNMATCH_NEGATIVE) != 0) {
-		/*
-		 * no chance of matching if rule is shorter than
-		 * the negated one
-		 */
-		if (rule->length < neg->length)
+
+		/* If lengths match we need to have an exact match */
+		if (rule->length == neg->length) {
+			return strcmp(rule->pattern, neg->pattern) == 0;
+		} else if (rule->length < neg->length) {
+			shorter = rule;
+			longer = neg;
+		} else {
+			shorter = neg;
+			longer = rule;
+		}
+
+		/* Otherwise, we need to check if the shorter
+		 * rule is a basename only (that is, it contains
+		 * no path separator) and, if so, if it
+		 * matches the tail of the longer rule */
+		p = longer->pattern + longer->length - shorter->length;
+
+		if (p[-1] != '/')
+			return false;
+		if (memchr(shorter->pattern, '/', shorter->length) != NULL)
 			return false;
 
-		/*
-		 * shift pattern so its tail aligns with the
-		 * negated pattern
-		 */
-		p = rule->pattern + rule->length - neg->length;
-		if (strcmp(p, neg->pattern) == 0)
-			return true;
+		return memcmp(p, shorter->pattern, shorter->length) == 0;
 	}
 
 	return false;
@@ -89,18 +118,20 @@ static int does_negate_rule(int *out, git_vector *rules, git_attr_fnmatch *match
 		}
 
 	/*
-	 * If we're dealing with a directory (which we know via the
-	 * strchr() check) we want to use 'dirname/<star>' as the
-	 * pattern so p_fnmatch() honours FNM_PATHNAME
+	 * When dealing with a directory, we add '/<star>' so
+	 * p_fnmatch() honours FNM_PATHNAME. Checking for LEADINGDIR
+	 * alone isn't enough as that's also set for nagations, so we
+	 * need to check that NEGATIVE is off.
 	 */
 		git_buf_clear(&buf);
 		if (rule->containing_dir) {
 			git_buf_puts(&buf, rule->containing_dir);
 		}
-		if (!strchr(rule->pattern, '*'))
-			error = git_buf_printf(&buf, "%s/*", rule->pattern);
-		else
-			error = git_buf_puts(&buf, rule->pattern);
+
+		error = git_buf_puts(&buf, rule->pattern);
+
+		if ((rule->flags & (GIT_ATTR_FNMATCH_LEADINGDIR | GIT_ATTR_FNMATCH_NEGATIVE)) == GIT_ATTR_FNMATCH_LEADINGDIR)
+			error = git_buf_PUTS(&buf, "/*");
 
 		if (error < 0)
 			goto out;
@@ -261,10 +292,18 @@ int git_ignore__for_path(
 		goto cleanup;
 
 	/* given a unrooted path in a non-bare repo, resolve it */
-	if (workdir && git_path_root(path) < 0)
-		error = git_path_find_dir(&ignores->dir, path, workdir);
-	else
+	if (workdir && git_path_root(path) < 0) {
+		git_buf local = GIT_BUF_INIT;
+
+		if ((error = git_path_dirname_r(&local, path)) < 0 ||
+		    (error = git_path_resolve_relative(&local, 0)) < 0 ||
+		    (error = git_path_to_dir(&local)) < 0 ||
+		    (error = git_buf_joinpath(&ignores->dir, workdir, local.ptr)) < 0)
+		{;} /* Nothing, we just want to stop on the first error */
+		git_buf_free(&local);
+	} else {
 		error = git_buf_joinpath(&ignores->dir, path, "");
+	}
 	if (error < 0)
 		goto cleanup;
 

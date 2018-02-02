@@ -10,6 +10,7 @@
 #include "http_parser.h"
 #include "buffer.h"
 #include "netops.h"
+#include "global.h"
 #include "remote.h"
 #include "smart.h"
 #include "auth.h"
@@ -113,7 +114,7 @@ static bool challenge_match(git_http_auth_scheme *scheme, void *data)
 	size_t scheme_len;
 
 	scheme_len = strlen(scheme_name);
-	return (strncmp(challenge, scheme_name, scheme_len) == 0 &&
+	return (strncasecmp(challenge, scheme_name, scheme_len) == 0 &&
 		(challenge[scheme_len] == '\0' || challenge[scheme_len] == ' '));
 }
 
@@ -186,6 +187,16 @@ static int apply_credentials(git_buf *buf, http_subtransport *t)
 	return context->next_token(buf, context, cred);
 }
 
+static const char *user_agent(void)
+{
+	const char *custom = git_libgit2__user_agent();
+
+	if (custom)
+		return custom;
+
+	return "libgit2 " LIBGIT2_VERSION;
+}
+
 static int gen_request(
 	git_buf *buf,
 	http_stream *s,
@@ -193,10 +204,11 @@ static int gen_request(
 {
 	http_subtransport *t = OWNING_SUBTRANSPORT(s);
 	const char *path = t->connection_data.path ? t->connection_data.path : "/";
+	size_t i;
 
 	git_buf_printf(buf, "%s %s%s HTTP/1.1\r\n", s->verb, path, s->service_url);
 
-	git_buf_puts(buf, "User-Agent: git/1.0 (libgit2 " LIBGIT2_VERSION ")\r\n");
+	git_buf_printf(buf, "User-Agent: git/1.0 (%s)\r\n", user_agent());
 	git_buf_printf(buf, "Host: %s\r\n", t->connection_data.host);
 
 	if (s->chunked || content_length > 0) {
@@ -209,6 +221,11 @@ static int gen_request(
 			git_buf_printf(buf, "Content-Length: %"PRIuZ "\r\n", content_length);
 	} else
 		git_buf_puts(buf, "Accept: */*\r\n");
+
+	for (i = 0; i < t->owner->custom_headers.count; i++) {
+		if (t->owner->custom_headers.strings[i])
+			git_buf_printf(buf, "%s\r\n", t->owner->custom_headers.strings[i]);
+	}
 
 	/* Apply credentials to the request */
 	if (apply_credentials(buf, t) < 0)
@@ -552,6 +569,7 @@ static int http_connect(http_subtransport *t)
 		git_stream_close(t->io);
 		git_stream_free(t->io);
 		t->io = NULL;
+		t->connected = 0;
 	}
 
 	if (t->connection_data.use_ssl) {

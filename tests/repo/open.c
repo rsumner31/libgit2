@@ -91,7 +91,7 @@ static void make_gitlink_dir(const char *dir, const char *linktext)
 {
 	git_buf path = GIT_BUF_INIT;
 
-	cl_git_pass(git_futils_mkdir(dir, NULL, 0777, GIT_MKDIR_VERIFY_DIR));
+	cl_git_pass(git_futils_mkdir(dir, 0777, GIT_MKDIR_VERIFY_DIR));
 	cl_git_pass(git_buf_joinpath(&path, dir, ".git"));
 	cl_git_rewritefile(path.ptr, linktext);
 	git_buf_free(&path);
@@ -196,8 +196,9 @@ void test_repo_open__failures(void)
 		&repo, "attr/sub", GIT_REPOSITORY_OPEN_NO_SEARCH, NULL));
 
 	/* fail with ceiling too low */
-	cl_git_pass(git_buf_joinpath(&ceiling, ceiling.ptr, "sub"));
 	cl_git_fail(git_repository_open_ext(&repo, "attr/sub", 0, ceiling.ptr));
+	cl_git_pass(git_buf_joinpath(&ceiling, ceiling.ptr, "sub"));
+	cl_git_fail(git_repository_open_ext(&repo, "attr/sub/sub", 0, ceiling.ptr));
 
 	/* fail with no repo */
 	cl_git_pass(p_mkdir("alternate", 0777));
@@ -222,7 +223,7 @@ void test_repo_open__bad_gitlinks(void)
 	cl_git_sandbox_init("attr");
 
 	cl_git_pass(p_mkdir("invalid", 0777));
-	cl_git_pass(git_futils_mkdir_r("invalid2/.git", NULL, 0777));
+	cl_git_pass(git_futils_mkdir_r("invalid2/.git", 0777));
 
 	for (scan = bad_links; *scan != NULL; scan++) {
 		make_gitlink_dir("alternate", *scan);
